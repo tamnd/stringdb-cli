@@ -2,61 +2,134 @@ package stringdb
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 )
 
-func TestGet(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("User-Agent") == "" {
-			t.Error("request carried no User-Agent")
-		}
-		_, _ = w.Write([]byte("ok"))
-	}))
-	defer srv.Close()
+func testServer(t *testing.T, mux *http.ServeMux) (*httptest.Server, *Client) {
+	t.Helper()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	cfg := DefaultConfig()
+	cfg.BaseURL = srv.URL
+	cfg.Rate = 0
+	cfg.Retries = 0
+	return srv, NewClient(cfg)
+}
 
-	c := NewClient()
-	c.Rate = 0 // no pacing in the test
-
-	body, err := c.Get(context.Background(), srv.URL)
+func TestResolveProteins(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/get_string_ids", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]wireProtein{
+			{
+				StringID:    "9606.ENSP00000269305",
+				NcbiTaxonID: "9606",
+				TaxonName:   "Homo sapiens",
+				PrefName:    "TP53",
+				Annotation:  "Tumor suppressor p53",
+			},
+		})
+	})
+	_, client := testServer(t, mux)
+	proteins, err := client.ResolveProteins(context.Background(), []string{"TP53"}, 9606, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(body) != "ok" {
-		t.Errorf("body = %q, want %q", body, "ok")
+	if len(proteins) != 1 {
+		t.Fatalf("len = %d, want 1", len(proteins))
+	}
+	p := proteins[0]
+	if p.StringID != "9606.ENSP00000269305" {
+		t.Errorf("StringID = %q", p.StringID)
+	}
+	if p.Name != "TP53" {
+		t.Errorf("Name = %q, want TP53", p.Name)
 	}
 }
 
-func TestGetRetriesOn503(t *testing.T) {
-	var hits int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
-		if hits < 3 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		_, _ = w.Write([]byte("recovered"))
-	}))
-	defer srv.Close()
-
-	c := NewClient()
-	c.Rate = 0
-	c.Retries = 5
-
-	start := time.Now()
-	body, err := c.Get(context.Background(), srv.URL)
+func TestGetInteractions(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/network", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]wireInteraction{
+			{
+				StringIDA: "9606.ENSP00000269305",
+				StringIDB: "9606.ENSP00000254719",
+				PrefNameA: "TP53",
+				PrefNameB: "RPA1",
+				Score:     0.9,
+				EScore:    0.8,
+			},
+			{
+				StringIDA: "9606.ENSP00000269305",
+				StringIDB: "9606.ENSP00000350432",
+				PrefNameA: "TP53",
+				PrefNameB: "MDM2",
+				Score:     0.999,
+				EScore:    0.9,
+			},
+		})
+	})
+	_, client := testServer(t, mux)
+	interactions, err := client.GetInteractions(context.Background(), []string{"TP53"}, 9606, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(body) != "recovered" {
-		t.Errorf("body = %q after retries", body)
+	if len(interactions) != 2 {
+		t.Fatalf("len = %d, want 2", len(interactions))
 	}
-	if hits != 3 {
-		t.Errorf("server saw %d hits, want 3", hits)
+	i := interactions[0]
+	if i.NameA != "TP53" {
+		t.Errorf("NameA = %q, want TP53", i.NameA)
 	}
-	if time.Since(start) < 500*time.Millisecond {
-		t.Error("retries did not back off")
+	if i.Score != 0.9 {
+		t.Errorf("Score = %v, want 0.9", i.Score)
+	}
+}
+
+func TestGetEnrichment(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/enrichment", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]wireEnrichment{
+			{
+				Category:       "Process",
+				Term:           "GO:0000077",
+				Description:    "DNA damage checkpoint signaling",
+				NumberOfGenes:  2,
+				FDR:            "4.5e-03",
+				PreferredNames: "BRCA1,TP53",
+			},
+		})
+	})
+	_, client := testServer(t, mux)
+	enrichments, err := client.GetEnrichment(context.Background(), []string{"TP53", "BRCA1"}, 9606)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(enrichments) != 1 {
+		t.Fatalf("len = %d, want 1", len(enrichments))
+	}
+	e := enrichments[0]
+	if e.Term != "GO:0000077" {
+		t.Errorf("Term = %q", e.Term)
+	}
+	if e.Description != "DNA damage checkpoint signaling" {
+		t.Errorf("Description = %q", e.Description)
+	}
+}
+
+func TestGetInteractionsEmpty(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/network", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]wireInteraction{})
+	})
+	_, client := testServer(t, mux)
+	interactions, err := client.GetInteractions(context.Background(), []string{"UNKNOWN999"}, 9606, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(interactions) != 0 {
+		t.Errorf("expected 0 interactions, got %d", len(interactions))
 	}
 }

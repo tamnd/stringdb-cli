@@ -1,200 +1,263 @@
-// Package stringdb is the library behind the stringdb command line:
-// the HTTP client, request shaping, and the typed data models for stringdb.
-//
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
 package stringdb
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"regexp"
+	"net/url"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to stringdb. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "stringdb/dev (+https://github.com/tamnd/stringdb-cli)"
+const Host = "string-db.org"
+const baseURL = "https://string-db.org/api/json"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at stringdb.com; change it once you
-// know the real endpoints you want to read.
-const Host = "stringdb.com"
-
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to stringdb over HTTP.
-type Client struct {
-	HTTP      *http.Client
+type Config struct {
+	BaseURL   string
+	CallerID  string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+}
 
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   baseURL,
+		CallerID:  "stringdb-cli",
+		Rate:      500 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
+		UserAgent: "stringdb-cli/0.1.0 (github.com/tamnd/stringdb-cli)",
+	}
+}
+
+type Client struct {
+	cfg  Config
+	http *http.Client
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
+func NewClient(cfg Config) *Client {
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
-	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(backoff(attempt)):
-			}
+func (c *Client) wait() {
+	if c.cfg.Rate > 0 {
+		if since := time.Since(c.last); since < c.cfg.Rate {
+			time.Sleep(c.cfg.Rate - since)
 		}
-		body, retry, err := c.do(ctx, url)
-		if err == nil {
-			return body, nil
-		}
-		lastErr = err
-		if !retry {
-			return nil, err
-		}
-	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
-}
-
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
-	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, false, err
-	}
-	req.Header.Set("User-Agent", c.UserAgent)
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, true, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
-	}
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
-}
-
-// pace blocks until at least Rate has passed since the previous request.
-func (c *Client) pace() {
-	if c.Rate <= 0 {
-		return
-	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
-		time.Sleep(wait)
 	}
 	c.last = time.Now()
 }
 
-func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
+func (c *Client) get(ctx context.Context, rawURL string, out any) error {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
+		if attempt > 0 {
+			d := time.Duration(attempt) * 500 * time.Millisecond
+			if d > 5*time.Second {
+				d = 5 * time.Second
+			}
+			time.Sleep(d)
+		}
+		c.wait()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", c.cfg.UserAgent)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			if attempt < c.cfg.Retries {
+				continue
+			}
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			return fmt.Errorf("not found")
+		}
+		if resp.StatusCode != http.StatusOK {
+			if attempt < c.cfg.Retries {
+				continue
+			}
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		return json.NewDecoder(resp.Body).Decode(out)
 	}
-	return d
+	return fmt.Errorf("all retries exhausted")
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on stringdb.com. It is a stand-in for the typed records you
-// will model from the real stringdb endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `stringdb cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+func (c *Client) buildURL(endpoint string, params map[string]string) string {
+	q := url.Values{}
+	for k, v := range params {
+		q.Set(k, v)
+	}
+	q.Set("caller_identity", c.cfg.CallerID)
+	return c.cfg.BaseURL + "/" + endpoint + "?" + q.Encode()
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
+// --- wire/output types ---
+
+// Protein represents a resolved STRING protein.
+type Protein struct {
+	StringID   string `json:"string_id"          kit:"id"`
+	Name       string `json:"name"`
+	TaxonName  string `json:"taxon_name"`
+	TaxonID    string `json:"taxon_id"`
+	Annotation string `json:"annotation,omitempty"`
+}
+
+type wireProtein struct {
+	StringID    string `json:"stringId"`
+	NcbiTaxonID string `json:"ncbiTaxonId"`
+	TaxonName   string `json:"taxonName"`
+	PrefName    string `json:"preferredName"`
+	Annotation  string `json:"annotation"`
+}
+
+func toProtein(w wireProtein) *Protein {
+	return &Protein{
+		StringID:   w.StringID,
+		Name:       w.PrefName,
+		TaxonName:  w.TaxonName,
+		TaxonID:    w.NcbiTaxonID,
+		Annotation: w.Annotation,
+	}
+}
+
+// Interaction represents a protein-protein interaction edge.
+type Interaction struct {
+	ProteinA   string  `json:"protein_a"           kit:"id"`
+	ProteinB   string  `json:"protein_b"`
+	NameA      string  `json:"name_a"`
+	NameB      string  `json:"name_b"`
+	Score      float64 `json:"score"`
+	TextScore  float64 `json:"text_score,omitempty"`
+	ExpScore   float64 `json:"exp_score,omitempty"`
+	DbScore    float64 `json:"db_score,omitempty"`
+	CoexpScore float64 `json:"coexp_score,omitempty"`
+}
+
+type wireInteraction struct {
+	StringIDA   string  `json:"stringId_A"`
+	StringIDB   string  `json:"stringId_B"`
+	PrefNameA   string  `json:"preferredName_A"`
+	PrefNameB   string  `json:"preferredName_B"`
+	NcbiTaxonID string  `json:"ncbiTaxonId"`
+	Score       float64 `json:"score"`
+	NScore      float64 `json:"nscore"`
+	FScore      float64 `json:"fscore"`
+	PScore      float64 `json:"pscore"`
+	AScore      float64 `json:"ascore"`
+	EScore      float64 `json:"escore"`
+	DScore      float64 `json:"dscore"`
+	TScore      float64 `json:"tscore"`
+}
+
+func toInteraction(w wireInteraction) *Interaction {
+	return &Interaction{
+		ProteinA:   w.PrefNameA,
+		ProteinB:   w.PrefNameB,
+		NameA:      w.PrefNameA,
+		NameB:      w.PrefNameB,
+		Score:      w.Score,
+		TextScore:  w.TScore,
+		ExpScore:   w.EScore,
+		DbScore:    w.DScore,
+		CoexpScore: w.AScore,
+	}
+}
+
+// Enrichment represents a functional enrichment term.
+type Enrichment struct {
+	Category    string `json:"category"              kit:"id"`
+	Term        string `json:"term"`
+	Description string `json:"description"`
+	Genes       int    `json:"genes"`
+	FDR         string `json:"fdr"`
+	InputGenes  string `json:"input_genes,omitempty"`
+}
+
+type wireEnrichment struct {
+	Category            string `json:"category"`
+	Term                string `json:"term"`
+	NumberOfGenes       int    `json:"number_of_genes"`
+	NumberOfGenesInBg   int    `json:"number_of_genes_in_background"`
+	NcbiTaxonID         string `json:"ncbiTaxonId"`
+	InputGenes          string `json:"inputGenes"`
+	PreferredNames      string `json:"preferredNames"`
+	FDR                 string `json:"fdr"`
+	Description         string `json:"description"`
+}
+
+func toEnrichment(w wireEnrichment) *Enrichment {
+	return &Enrichment{
+		Category:    w.Category,
+		Term:        w.Term,
+		Description: w.Description,
+		Genes:       w.NumberOfGenes,
+		FDR:         w.FDR,
+		InputGenes:  w.PreferredNames,
+	}
+}
+
+// ResolveProteins looks up STRING IDs for the given protein names.
+func (c *Client) ResolveProteins(ctx context.Context, names []string, species int, limit int) ([]*Protein, error) {
+	params := map[string]string{
+		"identifiers": strings.Join(names, "\n"),
+		"species":     fmt.Sprintf("%d", species),
+		"limit":       fmt.Sprintf("%d", limit),
+	}
+	u := c.buildURL("get_string_ids", params)
+	var wire []wireProtein
+	if err := c.get(ctx, u, &wire); err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	out := make([]*Protein, len(wire))
+	for i, w := range wire {
+		out[i] = toProtein(w)
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+// GetInteractions returns interactions for the given protein names.
+func (c *Client) GetInteractions(ctx context.Context, names []string, species int, limit int) ([]*Interaction, error) {
+	params := map[string]string{
+		"identifiers": strings.Join(names, "\n"),
+		"species":     fmt.Sprintf("%d", species),
+		"limit":       fmt.Sprintf("%d", limit),
 	}
-	return out
+	u := c.buildURL("network", params)
+	var wire []wireInteraction
+	if err := c.get(ctx, u, &wire); err != nil {
+		return nil, err
+	}
+	out := make([]*Interaction, len(wire))
+	for i, w := range wire {
+		out[i] = toInteraction(w)
+	}
+	return out, nil
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// GetEnrichment returns functional enrichment for a set of proteins.
+func (c *Client) GetEnrichment(ctx context.Context, names []string, species int) ([]*Enrichment, error) {
+	params := map[string]string{
+		"identifiers": strings.Join(names, "\n"),
+		"species":     fmt.Sprintf("%d", species),
 	}
-	return s
+	u := c.buildURL("enrichment", params)
+	var wire []wireEnrichment
+	if err := c.get(ctx, u, &wire); err != nil {
+		return nil, err
+	}
+	out := make([]*Enrichment, len(wire))
+	for i, w := range wire {
+		out[i] = toEnrichment(w)
+	}
+	return out, nil
 }
