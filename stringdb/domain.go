@@ -2,6 +2,7 @@ package stringdb
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"strings"
 
@@ -9,69 +10,51 @@ import (
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes stringdb as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/stringdb-cli/stringdb"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// stringdb:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone stringdb binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the stringdb driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "stringdb",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "stringdb",
-			Short:  "A command line for stringdb.",
-			Long: `A command line for stringdb.
+			Short:  "A command line for the STRING protein interaction database.",
+			Long: `A command line for STRING DB.
 
-stringdb reads public stringdb data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+stringdb queries the STRING protein-protein interaction database,
+covering 67 million proteins across 5,090 organisms. Look up protein
+interactions, functional enrichment, and resolve identifiers to STRING IDs.
+No API key required.`,
+			Site: "https://string-db.org",
 			Repo: "https://github.com/tamnd/stringdb-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `stringdb page` and
-	// `ant get stringdb://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{Name: "proteins", Group: "read", List: true,
+		Summary: "Resolve protein names to STRING IDs (--species, --limit)",
+		Args:    []kit.Arg{{Name: "name", Help: "protein name or gene symbol (e.g. TP53)"}}}, resolveProteins)
 
-	// List op: members of a page, the home of `stringdb links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// stringdb://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{Name: "interactions", Group: "read", List: true,
+		Summary: "Get interactions for proteins (--species, --limit)",
+		Args:    []kit.Arg{{Name: "name", Help: "protein name or gene symbol"}}}, getInteractions)
+
+	kit.Handle(app, kit.OpMeta{Name: "network", Group: "read", List: true,
+		Summary: "Get interaction network for multiple proteins (comma-separated, --species, --limit)",
+		Args:    []kit.Arg{{Name: "names", Help: "comma-separated protein names (e.g. TP53,BRCA1)"}}}, getNetwork)
+
+	kit.Handle(app, kit.OpMeta{Name: "enrich", Group: "read", List: true,
+		Summary: "Get functional enrichment for a set of proteins (comma-separated, --species)",
+		Args:    []kit.Arg{{Name: "names", Help: "comma-separated protein names"}}}, getEnrichment)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,45 +65,55 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
-
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type proteinsInput struct {
+	Name    string  `kit:"arg"          help:"protein name or gene symbol"`
+	Species int     `kit:"flag"         help:"NCBI taxon ID (default 9606 = human)"`
+	Limit   int     `kit:"flag,inherit" help:"max results"`
+	Client  *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type interactionsInput struct {
+	Name    string  `kit:"arg"          help:"protein name or gene symbol"`
+	Species int     `kit:"flag"         help:"NCBI taxon ID (default 9606 = human)"`
+	Limit   int     `kit:"flag,inherit" help:"max results"`
+	Client  *Client `kit:"inject"`
 }
 
-// --- handlers ---
+type networkInput struct {
+	Names   string  `kit:"arg"          help:"comma-separated protein names"`
+	Species int     `kit:"flag"         help:"NCBI taxon ID (default 9606 = human)"`
+	Limit   int     `kit:"flag,inherit" help:"max results per protein"`
+	Client  *Client `kit:"inject"`
+}
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+type enrichInput struct {
+	Names   string  `kit:"arg"  help:"comma-separated protein names"`
+	Species int     `kit:"flag" help:"NCBI taxon ID (default 9606 = human)"`
+	Client  *Client `kit:"inject"`
+}
+
+func speciesOr9606(s int) int {
+	if s == 0 {
+		return 9606
+	}
+	return s
+}
+
+func resolveProteins(ctx context.Context, in proteinsInput, emit func(*Protein) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	proteins, err := in.Client.ResolveProteins(ctx, []string{in.Name}, speciesOr9606(in.Species), limit)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
+	for _, p := range proteins {
 		if err := emit(p); err != nil {
 			return err
 		}
@@ -128,46 +121,79 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full stringdb.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized stringdb reference: %q", input)
+func getInteractions(ctx context.Context, in interactionsInput, emit func(*Interaction) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
 	}
-	return "page", id, nil
+	interactions, err := in.Client.GetInteractions(ctx, []string{in.Name}, speciesOr9606(in.Species), limit)
+	if err != nil {
+		return err
+	}
+	for _, i := range interactions {
+		if err := emit(i); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
-func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("stringdb has no resource type %q", uriType)
+func getNetwork(ctx context.Context, in networkInput, emit func(*Interaction) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+	names := splitNames(in.Names)
+	interactions, err := in.Client.GetInteractions(ctx, names, speciesOr9606(in.Species), limit)
+	if err != nil {
+		return err
+	}
+	for _, i := range interactions {
+		if err := emit(i); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+func getEnrichment(ctx context.Context, in enrichInput, emit func(*Enrichment) error) error {
+	names := splitNames(in.Names)
+	enrichments, err := in.Client.GetEnrichment(ctx, names, speciesOr9606(in.Species))
+	if err != nil {
+		return err
 	}
-	return strings.Trim(input, "/")
+	for _, e := range enrichments {
+		if err := emit(e); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
+func splitNames(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func (Domain) Classify(input string) (string, string, error) {
+	s := strings.TrimSpace(input)
+	if s == "" {
+		return "", "", errs.Usage("protein identifier required")
+	}
+	return "protein", s, nil
+}
+
+func (Domain) Locate(t, id string) (string, error) {
+	switch t {
+	case "protein":
+		return fmt.Sprintf("https://string-db.org/network/%s", url.PathEscape(id)), nil
+	default:
+		return "", errs.Usage("stringdb has no resource type %q", t)
+	}
 }
