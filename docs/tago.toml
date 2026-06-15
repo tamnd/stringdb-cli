@@ -1,0 +1,10 @@
+title       = "stringdb"
+baseURL     = "https://stringdb-cli.tamnd.com/"
+description = "A command line for stringdb."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/stringdb-cli"
